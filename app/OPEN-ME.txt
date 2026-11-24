@@ -1,0 +1,28 @@
+NPU Broadcast for Windows x64
+
+Extract the whole ZIP before opening NpuBroadcast.exe. Keep the extracted
+files together. Use a Windows 11 PC with an AMD Ryzen AI NPU and
+an available AMD VitisAI execution provider. The first launch of each
+effect may take longer while the NPU compiles its models.
+
+Open NPU Broadcast and click Use existing VB-CABLE. If multiple cables
+are installed, choose the one you want and click Name selected cable.
+Approve the Windows prompt. If the rename fails, use Settings > System >
+Sound > Input to rename that cable's recording endpoint. If your existing
+cable is in use, install an extra from https://vb-audio.com/Cable/. The
+cable stays visible after the app exits.
+
+Choose Microphone (NPU Broadcast) in your calling or recording app.
+NPU Broadcast follows your Windows default input until you select a physical
+microphone. With Noise removal and Room echo removal both off, your original
+voice passes through.
+
+Audio levels and Diagnostics are in the Voice effects card. Check Listen to
+my processed voice to monitor through the Windows default playback device.
+Capture starts when either effect is on or another app uses the virtual mic.
+In Settings, check Keep microphone active even with effects off to keep the
+meters live when no app is using the virtual mic. NPU Broadcast remembers
+your settings.
+
+Minimize to keep NPU Broadcast in the notification area. Click its icon or
+launch it again to restore the window. Close the window to exit.

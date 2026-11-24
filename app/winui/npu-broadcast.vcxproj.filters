@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Common">
+      <UniqueIdentifier>{8a2f4c31-5b7d-4e69-9c0a-1d3e6f8b2a45}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="XAML">
+      <UniqueIdentifier>{b3c5d7e9-1f2a-4c8b-8d6e-9f0a1b2c3d4e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Audio engine">
+      <UniqueIdentifier>{c4d6e8f0-2a3b-4d9c-9e7f-0a1b2c3d4e5f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="RNNoise">
+      <UniqueIdentifier>{d5e7f9a1-3b4c-4e0d-8f6a-1b2c3d4e5f60}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="app_context.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="tray.h">
+      <Filter>Common</Filter>
+    </ClInclude>
+    <ClInclude Include="App.xaml.h">
+      <Filter>XAML</Filter>
+    </ClInclude>
+    <ClInclude Include="MainWindow.xaml.h">
+      <Filter>XAML</Filter>
+    </ClInclude>
+    <ClCompile Include="pch.cpp">
+      <Filter>Common</Filter>
+    </ClCompile>
+    <ClCompile Include="window.cpp">
+      <Filter>Common</Filter>
+    </ClCompile>
+    <ClCompile Include="App.xaml.cpp">
+      <Filter>XAML</Filter>
+    </ClCompile>
+    <ClCompile Include="MainWindow.xaml.cpp">
+      <Filter>XAML</Filter>
+    </ClCompile>
+    <ClCompile Include="..\main.cpp">
+      <Filter>Audio engine</Filter>
+    </ClCompile>
+    <ClCompile Include="..\npu_usage.cpp">
+      <Filter>Audio engine</Filter>
+    </ClCompile>
+    <Midl Include="Project.idl">
+      <Filter>XAML</Filter>
+    </Midl>
+    <ApplicationDefinition Include="App.xaml">
+      <Filter>XAML</Filter>
+    </ApplicationDefinition>
+    <Page Include="MainWindow.xaml">
+      <Filter>XAML</Filter>
+    </Page>
+    <Manifest Include="app.manifest">
+      <Filter>Common</Filter>
+    </Manifest>
+    <ResourceCompile Include="..\app.rc">
+      <Filter>Common</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,17 @@
+/.phase1/
+__pycache__/
+/releases/v*/
+/app/winui/bin/
+/app/winui/obj/
+/app/winui/Generated Files/
+/.vscode/
+/.vs/
+/original-*-signature.txt
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.user

@@ -1,0 +1,168 @@
+<Window
+    x:Class="NpuBroadcast.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:primitives="using:Microsoft.UI.Xaml.Controls.Primitives"
+    Title="NPU Broadcast">
+    <Window.SystemBackdrop><MicaBackdrop /></Window.SystemBackdrop>
+    <Grid x:Name="Surface">
+        <Grid.Resources>
+            <CornerRadius x:Key="OverlayCornerRadius">10</CornerRadius>
+            <Style x:Key="Card" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="12" />
+                <Setter Property="Padding" Value="18,14" />
+            </Style>
+            <Style x:Key="Picker" TargetType="ComboBox">
+                <Setter Property="HorizontalAlignment" Value="Stretch" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="primitives:ComboBoxHelper.KeepInteriorCornersSquare" Value="False" />
+            </Style>
+        </Grid.Resources>
+        <NavigationView x:Name="Nav" PaneDisplayMode="Auto" ExpandedModeThresholdWidth="930"
+                        CompactModeThresholdWidth="630" OpenPaneLength="188" IsBackButtonVisible="Collapsed"
+                        IsSettingsVisible="False" SelectionChanged="OnNavSelectionChanged">
+            <NavigationView.MenuItems>
+                <NavigationViewItem Content="Microphone" Icon="Audio" Tag="route" IsSelected="True" />
+                <NavigationViewItem Content="Settings" Icon="Setting" Tag="developer" />
+                <NavigationViewItem Content="About" Icon="Help" Tag="about" />
+            </NavigationView.MenuItems>
+            <Grid>
+                <Grid x:Name="RoutePage" Padding="22,8,22,14" RowSpacing="12" MaxWidth="880">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                        <RowDefinition Height="Auto" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Text="Microphone" Style="{ThemeResource TitleTextBlockStyle}" />
+                    <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+                        <StackPanel Spacing="12">
+                            <Border Style="{StaticResource Card}">
+                                <StackPanel Spacing="10">
+                                    <TextBlock Text="Devices" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                                    <ComboBox x:Name="InputBox" Header="Microphone input" Style="{StaticResource Picker}" />
+                                    <TextBlock x:Name="DestinationText" TextWrapping="Wrap"
+                                               Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <StackPanel x:Name="CableSetup" Spacing="8" Visibility="Collapsed">
+                                        <HyperlinkButton Content="Get an additional VB-CABLE"
+                                                         NavigateUri="https://vb-audio.com/Cable/" />
+                                        <ComboBox x:Name="CableSetupBox" Header="Cable to use"
+                                                  Style="{StaticResource Picker}" />
+                                        <Button x:Name="CableNameButton" Content="Name selected cable" />
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                            <Border Style="{StaticResource Card}">
+                                <StackPanel Spacing="10">
+                                    <TextBlock Text="Voice effects" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <StackPanel VerticalAlignment="Center" Spacing="2">
+                                            <TextBlock Text="Noise removal" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                                            <TextBlock Text="Reduces background noise." Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch x:Name="NoiseSwitch" Grid.Column="1" IsOn="False" MinWidth="0"
+                                                      OnContent="" OffContent="" AutomationProperties.Name="Noise removal" />
+                                    </Grid>
+                                    <Grid x:Name="NoiseStrengthPanel" ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <TextBlock Text="Strength" VerticalAlignment="Center" />
+                                        <Slider x:Name="NoiseStrength" Grid.Column="1" Minimum="0" Maximum="100" Value="100"
+                                                StepFrequency="1" SmallChange="1" LargeChange="10" AutomationProperties.Name="Noise removal strength, percent" />
+                                        <TextBlock x:Name="NoiseStrengthValue" Grid.Column="2" Text="100%" MinWidth="42"
+                                                   HorizontalTextAlignment="Right" VerticalAlignment="Center" />
+                                    </Grid>
+                                    <Border Height="1" Background="{ThemeResource DividerStrokeColorDefaultBrush}" Margin="0,4" />
+                                    <Grid ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <StackPanel VerticalAlignment="Center" Spacing="2">
+                                            <TextBlock Text="Room echo removal" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                                            <TextBlock Text="Reduces room reverberation." Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                        <ToggleSwitch x:Name="EchoSwitch" Grid.Column="1" IsOn="False" MinWidth="0"
+                                                      OnContent="" OffContent="" AutomationProperties.Name="Room echo removal" />
+                                    </Grid>
+                                    <Grid x:Name="EchoStrengthPanel" ColumnSpacing="12">
+                                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                        <TextBlock Text="Strength" VerticalAlignment="Center" />
+                                        <Slider x:Name="EchoStrength" Grid.Column="1" Minimum="0" Maximum="100" Value="65"
+                                                StepFrequency="1" SmallChange="1" LargeChange="10" AutomationProperties.Name="Room echo removal strength, percent" />
+                                        <TextBlock x:Name="EchoStrengthValue" Grid.Column="2" Text="65%" MinWidth="42"
+                                                   HorizontalTextAlignment="Right" VerticalAlignment="Center" />
+                                    </Grid>
+                                    <Border Height="1" Background="{ThemeResource DividerStrokeColorDefaultBrush}" Margin="0,4" />
+                                    <StackPanel Spacing="10">
+                                        <TextBlock Text="Audio levels" Style="{ThemeResource BodyStrongTextBlockStyle}" />
+                                        <StackPanel Spacing="4">
+                                            <Grid ColumnSpacing="8">
+                                                <TextBlock Text="Mic input" />
+                                                <TextBlock x:Name="InputPeak" Text="Idle" HorizontalAlignment="Right"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </Grid>
+                                            <Border Height="12" CornerRadius="6" Background="{ThemeResource ControlFillColorSecondaryBrush}">
+                                                <Grid x:Name="InputTrack">
+                                                    <Border x:Name="InputMeter" Width="0" HorizontalAlignment="Left"
+                                                            CornerRadius="6" Background="{ThemeResource AccentFillColorDefaultBrush}" />
+                                                </Grid>
+                                            </Border>
+                                        </StackPanel>
+                                        <StackPanel Spacing="4">
+                                            <Grid ColumnSpacing="8">
+                                                <TextBlock Text="Mic output" />
+                                                <TextBlock x:Name="OutputPeak" Text="Idle" HorizontalAlignment="Right"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                            </Grid>
+                                            <Border Height="12" CornerRadius="6" Background="{ThemeResource ControlFillColorSecondaryBrush}">
+                                                <Grid x:Name="OutputTrack">
+                                                    <Border x:Name="OutputMeter" Width="0" HorizontalAlignment="Left"
+                                                            CornerRadius="6" Background="{ThemeResource AccentFillColorDefaultBrush}" />
+                                                </Grid>
+                                            </Border>
+                                        </StackPanel>
+                                        <CheckBox x:Name="ListenBox" Content="Listen to my processed voice" />
+                                        <TextBlock x:Name="MonitorText" TextWrapping="Wrap"
+                                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                        <Expander x:Name="Diagnostics" Header="Diagnostics" HorizontalAlignment="Stretch"
+                                                  HorizontalContentAlignment="Stretch">
+                                            <TextBlock x:Name="DropText" TextWrapping="Wrap"
+                                                       Style="{ThemeResource CaptionTextBlockStyle}" />
+                                        </Expander>
+                                    </StackPanel>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </ScrollViewer>
+                    <TextBlock x:Name="StatusText" Grid.Row="2" Text="Idle" TextWrapping="Wrap" />
+                </Grid>
+                <ScrollViewer x:Name="DeveloperPage" Visibility="Collapsed">
+                    <StackPanel Padding="22,8,22,22" Spacing="12" MaxWidth="880" HorizontalAlignment="Stretch">
+                        <TextBlock Text="Settings" Style="{ThemeResource TitleTextBlockStyle}" />
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel Spacing="4">
+                                <CheckBox x:Name="KeepCapture" Content="Keep microphone active even with effects off" />
+                                <CheckBox x:Name="DeveloperConsole" Content="Show diagnostic console" />
+                                <TextBlock x:Name="ConsoleMessage" Text="Shows audio and model logs for this session."
+                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+                <ScrollViewer x:Name="AboutPage" Visibility="Collapsed">
+                    <StackPanel Padding="22,8,22,22" Spacing="12" MaxWidth="880" HorizontalAlignment="Stretch">
+                        <TextBlock Text="About" Style="{ThemeResource TitleTextBlockStyle}" />
+                        <Border Style="{StaticResource Card}">
+                            <StackPanel Spacing="8">
+                                <TextBlock Text="NPU Broadcast" Style="{ThemeResource SubtitleTextBlockStyle}" />
+                                <TextBlock Text="RNNoise handles noise removal. LocalVQE reduces noise and room reverberation. Both use the AMD NPU through Windows ML." TextWrapping="Wrap" />
+                                <TextBlock Text="RNNoise is distributed under the BSD-3-Clause license." TextWrapping="Wrap" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+            </Grid>
+        </NavigationView>
+    </Grid>
+</Window>

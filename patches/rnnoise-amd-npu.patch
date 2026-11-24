@@ -1,0 +1,849 @@
+diff --git a/examples/rnnoise_demo.c b/examples/rnnoise_demo.c
+index b9723f9..37a1829 100644
+--- a/examples/rnnoise_demo.c
++++ b/examples/rnnoise_demo.c
+@@ -26,10 +26,12 @@
+ */
+ 
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #ifdef _WIN32
+ #include <fcntl.h>
+ #include <io.h>
++#include <windows.h>
+ #endif
+ #include "rnnoise.h"
+ 
+@@ -41,6 +43,12 @@ int main(int argc, char **argv) {
+   float x[FRAME_SIZE];
+   FILE *f1, *fout;
+   DenoiseState *st;
++#ifdef _WIN32
++  HANDLE timer = NULL;
++  LARGE_INTEGER frequency, due, start, end;
++  LONGLONG next_frame = 0;
++  int paced = getenv("RNNOISE_PCM_PACED") != NULL;
++#endif
+ #ifdef USE_WEIGHTS_FILE
+   RNNModel *model = rnnoise_model_from_filename("weights_blob.bin");
+   st = rnnoise_create(model);
+@@ -84,17 +92,71 @@ int main(int argc, char **argv) {
+     if (f1 != stdin) fclose(f1);
+     return 1;
+   }
++#ifdef _WIN32
++  if (paced) {
++    timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
++    if (!timer || !QueryPerformanceFrequency(&frequency)) {
++      fprintf(stderr, "could not initialize the 10 ms replay timer\n");
++      return 1;
++    }
++  }
++#endif
+   while (1) {
+     short tmp[FRAME_SIZE];
+-    fread(tmp, sizeof(short), FRAME_SIZE, f1);
+-    if (feof(f1)) break;
++    size_t samples = fread(tmp, sizeof(short), FRAME_SIZE, f1);
++    if (samples != FRAME_SIZE) {
++      if (ferror(f1)) {
++        fprintf(stderr, "could not read input PCM\n");
++        return 1;
++      }
++      break;
++    }
++#ifdef _WIN32
++    if (paced) {
++      QueryPerformanceCounter(&start);
++      if (!first && start.QuadPart < next_frame) {
++        due.QuadPart = -((next_frame - start.QuadPart) * 10000000 / frequency.QuadPart);
++        if (due.QuadPart == 0) due.QuadPart = -1;
++        if (!SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE) ||
++            WaitForSingleObject(timer, INFINITE) != WAIT_OBJECT_0) {
++          fprintf(stderr, "10 ms replay timer failed\n");
++          return 1;
++        }
++        QueryPerformanceCounter(&start);
++      }
++    }
++#endif
+     for (i=0;i<FRAME_SIZE;i++) x[i] = tmp[i];
+     rnnoise_process_frame(st, x, x);
+-    for (i=0;i<FRAME_SIZE;i++) tmp[i] = x[i];
+-    if (!first) fwrite(tmp, sizeof(short), FRAME_SIZE, fout);
++    for (i=0;i<FRAME_SIZE;i++) {
++      if (x[i] > 32767.0f) x[i] = 32767.0f;
++      if (x[i] < -32768.0f) x[i] = -32768.0f;
++      tmp[i] = (short)x[i];
++    }
++    if (!first && fwrite(tmp, sizeof(short), FRAME_SIZE, fout) != FRAME_SIZE) {
++      fprintf(stderr, "could not write output PCM\n");
++      return 1;
++    }
++#ifdef _WIN32
++    if (paced) {
++      QueryPerformanceCounter(&end);
++      if (first) {
++        fprintf(stderr, "cold_us %.3f\n", 1000000.0 * (end.QuadPart - start.QuadPart) / frequency.QuadPart);
++        next_frame = end.QuadPart;
++      } else {
++        fprintf(stderr, "frame_us %.3f %.3f\n",
++            1000000.0 * (end.QuadPart - start.QuadPart) / frequency.QuadPart,
++            1000000.0 * (end.QuadPart - next_frame) / frequency.QuadPart);
++      }
++      next_frame += frequency.QuadPart / 100;
++    }
++#endif
+     first = 0;
+   }
+   rnnoise_destroy(st);
++#ifdef _WIN32
++  if (timer) CloseHandle(timer);
++#endif
+   if (f1 != stdin) fclose(f1);
+   if (fout != stdout) fclose(fout);
+ #ifdef USE_WEIGHTS_FILE
+diff --git a/src/denoise.c b/src/denoise.c
+index 76e8092..f8a63b5 100644
+--- a/src/denoise.c
++++ b/src/denoise.c
+@@ -66,6 +66,9 @@
+ 
+ #if defined(RNNOISE_ENABLE_EXTERNAL_RNN)
+ static int rnnoise_external_enabled(void) {
++#ifdef RNNOISE_ENABLE_WINML
++  if (rnn_winml_requires_npu()) return 1;
++#endif
+   const char *enabled = getenv(RNN_EXTERNAL_USE_ENV);
+   return enabled == NULL || strcmp(enabled, "0") != 0;
+ }
+@@ -73,8 +76,7 @@ static int rnnoise_external_enabled(void) {
+ 
+ static int rnnoise_external_strict_required(void) {
+ #ifdef RNNOISE_ENABLE_WINML
+-  const char *require_npu = getenv("RNNOISE_WINML_REQUIRE_NPU");
+-  return require_npu != NULL && require_npu[0] != '\0';
++  return rnn_winml_requires_npu();
+ #else
+   return 0;
+ #endif
+diff --git a/src/rnn_winml.cpp b/src/rnn_winml.cpp
+index 010fa2d..807c0ac 100644
+--- a/src/rnn_winml.cpp
++++ b/src/rnn_winml.cpp
+@@ -1,11 +1,15 @@
+ #include <algorithm>
++#include <array>
++#include <atomic>
+ #include <cerrno>
+ #include <cctype>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <memory>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -15,6 +19,7 @@
+ #include <WinMLEpCatalog.h>
+ #include <winml/dml_provider_factory.h>
+ #include "onnxruntime_c_api.h"
++#include <winml/onnxruntime_cxx_api.h>
+ #include <winml/onnxruntime_session_options_config_keys.h>
+ 
+ extern "C" {
+@@ -24,6 +29,175 @@ extern "C" {
+ 
+ namespace {
+ 
++constexpr char kVitisAIProvider[] = "VitisAIExecutionProvider";
++constexpr uint32_t kAmdVendorId = 0x1022;
++constexpr int kMatrixCount = 10;
++constexpr int kEchoMatrixCount = 20;
++constexpr int kEchoStates = 30;
++constexpr size_t kEchoHop = 256;
++using InferenceClock = std::chrono::steady_clock;
++thread_local long long inference_us = -1;
++
++void set_inference_time(InferenceClock::time_point started) {
++  inference_us = std::chrono::duration_cast<std::chrono::microseconds>(InferenceClock::now() - started).count();
++}
++
++int64_t round_channels(int64_t count) {
++  return (count + 7) / 8 * 8;
++}
++
++struct MatrixKernel {
++  const OrtApi &api;
++  OrtSession *session;
++  const OrtMemoryInfo *memory;
++  std::array<int64_t, 4> shape_in;
++  std::array<int64_t, 4> shape_out;
++
++  OrtStatus *ComputeV2(OrtKernelContext *raw_context) noexcept {
++    try {
++      Ort::KernelContext context(raw_context);
++      auto input = context.GetInput(0);
++      auto input_shape = shape_in;
++      auto output_shape = shape_out;
++      input_shape[1] = round_channels(shape_in[1]);
++      output_shape[1] = round_channels(shape_out[1]);
++      const auto input_size = [](const auto &shape) {
++        return static_cast<size_t>(shape[1] * shape[2] * shape[3]);
++      };
++      const auto input_samples = input_size(shape_in);
++      const auto output_samples = input_size(shape_out);
++      if (input.GetTensorTypeAndShapeInfo().GetElementCount() != input_samples) {
++        return api.CreateStatus(ORT_INVALID_ARGUMENT, "RNNoise projection input size mismatch");
++      }
++      auto output = context.GetOutput(0, shape_out.data(), shape_out.size());
++      const float *source = input.GetTensorData<float>();
++      std::vector<float> padded_input;
++      if (input_shape[1] != shape_in[1]) {
++        padded_input.assign(input_size(input_shape), 0.0f);
++        std::copy_n(source, input_samples, padded_input.data());
++        source = padded_input.data();
++      }
++      auto tensor = Ort::Value::CreateTensor<float>(
++          memory, const_cast<float *>(source), input_size(input_shape), input_shape.data(), input_shape.size());
++      const OrtValue *leaf_input = tensor;
++      OrtValue *leaf_output = output;
++      std::vector<float> padded_output;
++      Ort::Value buffer{nullptr};
++      if (output_shape[1] != shape_out[1]) {
++        padded_output.resize(input_size(output_shape));
++        buffer = Ort::Value::CreateTensor<float>(memory, padded_output.data(), padded_output.size(),
++                                                   output_shape.data(), output_shape.size());
++        leaf_output = buffer;
++      }
++      const char *in_name = "input";
++      const char *out_name = "output";
++      OrtStatus *status = api.Run(session, nullptr, &in_name, &leaf_input, 1, &out_name, 1, &leaf_output);
++      if (!status && !padded_output.empty()) {
++        std::copy_n(padded_output.data(), output_samples, output.GetTensorMutableData<float>());
++      }
++      return status;
++    } catch (const Ort::Exception &error) {
++      return api.CreateStatus(error.GetOrtErrorCode(), error.what());
++    } catch (const std::exception &error) {
++      return api.CreateStatus(ORT_FAIL, error.what());
++    }
++  }
++};
++
++struct MatrixOp : Ort::CustomOpBase<MatrixOp, MatrixKernel, true> {
++  std::vector<Ort::Session> sessions;
++  const OrtMemoryInfo *memory;
++  bool spatial;
++  mutable std::atomic<uint32_t> bound{0};
++
++  MatrixOp(const OrtMemoryInfo *memory, bool spatial) : memory(memory), spatial(spatial) {
++    sessions.reserve(spatial ? kEchoMatrixCount : kMatrixCount);
++  }
++
++  const char *GetName() const { return spatial ? "ConvolveOnNpu" : "ProjectOnNpu"; }
++  size_t GetInputTypeCount() const { return 1; }
++  size_t GetOutputTypeCount() const { return 1; }
++  ONNXTensorElementDataType GetInputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
++  ONNXTensorElementDataType GetOutputType(size_t) const { return ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT; }
++
++  OrtStatus *CreateKernelV2(const OrtApi &api, const OrtKernelInfo *raw_info, void **kernel) const noexcept {
++    try {
++      Ort::ConstKernelInfo info(raw_info);
++      const auto matrix = info.GetAttribute<int64_t>("matrix");
++      const auto inputs = info.GetAttribute<int64_t>("input_channels");
++      const auto outputs = info.GetAttribute<int64_t>("output_channels");
++      if (matrix < 0 || static_cast<size_t>(matrix) >= sessions.size() || inputs <= 0 || outputs <= 0 ||
++          inputs > 4096 || outputs > 4096) {
++        return api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid RNNoise projection attributes");
++      }
++      const auto input_height = spatial ? info.GetAttribute<int64_t>("input_height") : 1;
++      const auto input_width = spatial ? info.GetAttribute<int64_t>("input_width") : 1;
++      const auto output_height = spatial ? info.GetAttribute<int64_t>("output_height") : 1;
++      const auto output_width = spatial ? info.GetAttribute<int64_t>("output_width") : 1;
++      if (input_height <= 0 || input_height > 64 || output_height <= 0 || output_height > 64 ||
++          input_width <= 0 || input_width > 512 || output_width <= 0 || output_width > 512) {
++        return api.CreateStatus(ORT_INVALID_ARGUMENT, "Invalid spatial convolution dimensions");
++      }
++      *kernel = new MatrixKernel{api, sessions[static_cast<size_t>(matrix)], memory,
++          {1, inputs, input_height, input_width}, {1, outputs, output_height, output_width}};
++      bound.fetch_or(uint32_t{1} << matrix, std::memory_order_relaxed);
++      return nullptr;
++    } catch (const Ort::Exception &error) {
++      return api.CreateStatus(error.GetOrtErrorCode(), error.what());
++    } catch (const std::exception &error) {
++      return api.CreateStatus(ORT_FAIL, error.what());
++    }
++  }
++};
++
++struct MatrixGraph {
++  MatrixOp op;
++  Ort::CustomOpDomain domain{"npu.broadcast"};
++
++  MatrixGraph(const OrtMemoryInfo *memory, bool spatial) : op(memory, spatial) { domain.Add(&op); }
++};
++
++struct EchoState {
++  std::array<float, kEchoHop * 2> window{};
++  std::array<float, kEchoHop * 2> result{};
++  std::array<float, kEchoHop> tail{};
++  std::array<std::string, kEchoStates> input_labels;
++  std::array<std::string, kEchoStates> output_labels;
++  std::array<const char *, kEchoStates + 1> input_names;
++  std::array<const char *, kEchoStates + 1> output_names;
++  std::vector<Ort::Value> states;
++  std::vector<Ort::Value> next;
++  Ort::Value window_tensor{nullptr};
++  Ort::Value result_tensor{nullptr};
++
++  EchoState(OrtSession *session, const OrtMemoryInfo *memory) {
++    const Ort::UnownedSession model(session);
++    if (model.GetInputCount() != input_names.size() || model.GetOutputCount() != output_names.size()) {
++      throw std::runtime_error("Invalid room-echo model interface.");
++    }
++    const int64_t pcm_shape[] = {1, kEchoHop * 2};
++    window_tensor = Ort::Value::CreateTensor<float>(memory, window.data(), window.size(), pcm_shape, 2);
++    result_tensor = Ort::Value::CreateTensor<float>(memory, result.data(), result.size(), pcm_shape, 2);
++    input_names[0] = "window";
++    output_names[0] = "enhanced_window";
++    Ort::AllocatorWithDefaultOptions allocator;
++    states.reserve(kEchoStates);
++    next.reserve(kEchoStates);
++    for (size_t index = 0; index < kEchoStates; ++index) {
++      input_labels[index] = "state_" + std::to_string(index);
++      output_labels[index] = "next_" + input_labels[index];
++      input_names[index + 1] = input_labels[index].c_str();
++      output_names[index + 1] = output_labels[index].c_str();
++      const auto type = model.GetInputTypeInfo(index + 1);
++      const auto shape_info = type.GetTensorTypeAndShapeInfo();
++      const auto shape = shape_info.GetShape();
++      states.push_back(Ort::Value::CreateTensor<float>(allocator, shape.data(), shape.size()));
++      next.push_back(Ort::Value::CreateTensor<float>(allocator, shape.data(), shape.size()));
++      std::fill_n(states.back().GetTensorMutableData<float>(), shape_info.GetElementCount(), 0.0f);
++    }
++  }
++};
++
+ struct RegisteredProvider {
+   std::string name;
+   std::string path;
+@@ -64,12 +238,17 @@ struct WinMLState {
+   OrtSessionOptions *options = nullptr;
+   OrtSession *session = nullptr;
+   OrtMemoryInfo *memory_info = nullptr;
++  std::unique_ptr<MatrixGraph> matrix_graph;
++  std::unique_ptr<EchoState> echo;
+   WinMLEpCatalogHandle catalog = nullptr;
+   std::vector<RegisteredProvider> providers;
+   std::string selected_device;
++  uint32_t npu_device_id = 0;
+   std::wstring model_path;
++  std::unique_ptr<FILE, decltype(&std::fclose)> calibration{nullptr, std::fclose};
+   size_t next_candidate = 0;
+   bool ready_openvino_catalog_provider = false;
++  bool profiling = false;
+   bool initialized = false;
+ };
+ 
+@@ -146,7 +325,7 @@ bool contains_case_insensitive(const char *text, const char *needle) {
+ ForcedSessionKind parse_forced_session_kind(const char *value) {
+   if (value == nullptr || value[0] == '\0') return ForcedSessionKind::Auto;
+   if (contains_case_insensitive(value, "auto")) return ForcedSessionKind::Auto;
+-  if (contains_case_insensitive(value, "npu")) return ForcedSessionKind::Npu;
++  if (_stricmp(value, "npu") == 0) return ForcedSessionKind::Npu;
+   if (contains_case_insensitive(value, "max")) return ForcedSessionKind::MaxPerformance;
+   if (contains_case_insensitive(value, "cpu")) return ForcedSessionKind::Cpu;
+   if (contains_case_insensitive(value, "dml") || contains_case_insensitive(value, "directml")) {
+@@ -202,10 +381,16 @@ void trim_trailing_nulls(std::string &value) {
+   while (!value.empty() && value.back() == '\0') value.pop_back();
+ }
+ 
++struct CatalogCollection {
++  std::vector<CatalogProvider> providers;
++  bool amd_npu_only;
++};
++
+ BOOL CALLBACK collect_provider(WinMLEpHandle ep, const WinMLEpInfo *info, void *context) {
+-  auto *providers = static_cast<std::vector<CatalogProvider> *>(context);
++  auto &collection = *static_cast<CatalogCollection *>(context);
+   CatalogProvider provider;
+   provider.name = info != nullptr && info->name != nullptr ? info->name : "";
++  if (collection.amd_npu_only && provider.name != kVitisAIProvider) return TRUE;
+   provider.path = info != nullptr && info->libraryPath != nullptr ? info->libraryPath : "";
+   provider.ready_state = info != nullptr ? info->readyState : WinMLEpReadyState_NotPresent;
+   provider.certification = info != nullptr ? info->certification : WinMLEpCertification_Unknown;
+@@ -239,20 +424,20 @@ BOOL CALLBACK collect_provider(WinMLEpHandle ep, const WinMLEpInfo *info, void *
+     }
+   }
+ 
+-  providers->push_back(provider);
++  collection.providers.push_back(std::move(provider));
+   return TRUE;
+ }
+ 
+-bool register_catalog_providers(WinMLState &state) {
+-  if (failed_hr(WinMLEpCatalogCreate(&state.catalog), "WinMLEpCatalogCreate")) return true;
++bool register_catalog_providers(WinMLState &state, bool amd_npu_only) {
++  if (failed_hr(WinMLEpCatalogCreate(&state.catalog), "WinMLEpCatalogCreate")) return false;
+ 
+-  std::vector<CatalogProvider> providers;
+-  if (failed_hr(WinMLEpCatalogEnumProviders(state.catalog, collect_provider, &providers),
++  CatalogCollection collection{{}, amd_npu_only};
++  if (failed_hr(WinMLEpCatalogEnumProviders(state.catalog, collect_provider, &collection),
+                 "WinMLEpCatalogEnumProviders")) {
+-    return true;
++    return false;
+   }
+ 
+-  for (const CatalogProvider &provider : providers) {
++  for (const CatalogProvider &provider : collection.providers) {
+     std::fprintf(stderr, "rnnoise winml: catalog provider name=%s ready=%s path=%s\n",
+         provider.name.c_str(), ready_state_name(provider.ready_state), provider.path.c_str());
+     if (provider.ready_state == WinMLEpReadyState_Ready &&
+@@ -340,10 +525,13 @@ bool ep_name_contains(WinMLState &state, const OrtEpDevice *ep_device, const cha
+   return contains_case_insensitive(ep_name, needle);
+ }
+ 
+-bool append_ep_device(WinMLState &state, const OrtEpDevice *ep_device) {
++bool append_ep_device(WinMLState &state, const OrtEpDevice *ep_device, const char *report_cache = nullptr) {
+   const OrtEpDevice *devices[] = {ep_device};
++  const char *keys[] = {"enable_cache_file_io_in_mem", "cache_dir"};
++  const char *values[] = {"0", report_cache};
+   return check_status(state,
+-      state.ort->SessionOptionsAppendExecutionProvider_V2(state.options, state.env, devices, 1, nullptr, nullptr, 0),
++      state.ort->SessionOptionsAppendExecutionProvider_V2(state.options, state.env, devices, 1,
++          report_cache ? keys : nullptr, report_cache ? values : nullptr, report_cache ? 2 : 0),
+       "SessionOptionsAppendExecutionProvider_V2");
+ }
+ 
+@@ -402,15 +590,86 @@ bool try_create_openvino_npu_session(WinMLState &state) {
+   return create_session(state, label.c_str());
+ }
+ 
+-bool try_create_npu_session(WinMLState &state) {
++bool create_matrix_graph(WinMLState &state, const OrtEpDevice *device, const char *directory, const char *report_cache) {
++  try {
++    const bool room_echo = std::getenv("RNNOISE_WINML_ROOM_ECHO") != nullptr;
++    const int matrix_count = room_echo ? kEchoMatrixCount : kMatrixCount;
++    auto matrices = std::make_unique<MatrixGraph>(state.memory_info, room_echo);
++    if (!create_options(state, true) || !append_ep_device(state, device, report_cache)) return false;
++    Ort::UnownedSessionOptions leaf_options(state.options);
++    leaf_options.SetGraphOptimizationLevel(ORT_DISABLE_ALL).SetIntraOpNumThreads(1).SetInterOpNumThreads(1);
++    const auto root = absolute_path(directory);
++    for (int index = 0; index < matrix_count; ++index) {
++      const auto path = root + L"\\matrix-" + std::to_wstring(index) + L".onnx";
++      std::fwprintf(stderr, L"rnnoise winml: loading NPU projection %ls\n", path.c_str());
++      OrtSession *session = nullptr;
++      if (!check_status(state, state.ort->CreateSession(state.env, path.c_str(), state.options, &session),
++              "CreateSession(NPU projection)")) return false;
++      matrices->op.sessions.emplace_back(session);
++    }
++    if (!create_options(state, false)) return false;
++    Ort::UnownedSessionOptions coordinator_options(state.options);
++    coordinator_options.Add(matrices->domain).SetIntraOpNumThreads(1).SetInterOpNumThreads(1);
++    state.matrix_graph = std::move(matrices);
++    const auto label = std::string("CPU coordination with isolated NPU convolutions via ") +
++        describe_ep_device(state, device);
++    if (!create_session(state, label.c_str())) return false;
++    if (state.matrix_graph->op.bound.load(std::memory_order_relaxed) != ((uint32_t{1} << matrix_count) - 1)) {
++      std::fprintf(stderr, "rnnoise winml: host graph did not bind every NPU convolution\n");
++      return false;
++    }
++    if (room_echo) state.echo = std::make_unique<EchoState>(state.session, state.memory_info);
++    return true;
++  } catch (const std::exception &error) {
++    std::fprintf(stderr, "rnnoise winml: failed to initialize NPU projections: %s\n", error.what());
++    return false;
++  }
++}
++
++bool try_create_npu_session(WinMLState &state, bool amd_npu_only = false) {
++  const char *profile_path = amd_npu_only ? std::getenv("RNNOISE_WINML_PROFILE") : nullptr;
++  const char *report_cache = amd_npu_only ? std::getenv("RNNOISE_WINML_REPORT_CACHE") : nullptr;
++  const char *matrix_dir = amd_npu_only ? std::getenv("RNNOISE_WINML_MATRIX_DIR") : nullptr;
++  const char *allow_partial = amd_npu_only ? std::getenv("RNNOISE_WINML_ALLOW_CPU_PARTITIONS") : nullptr;
++  const bool cpu_partitions = allow_partial && std::strcmp(allow_partial, "1") == 0;
++  if (cpu_partitions && (!profile_path || !*profile_path)) {
++    std::fprintf(stderr, "rnnoise winml: allowing CPU partitions requires inference profiling\n");
++    return false;
++  }
+   std::vector<const OrtEpDevice *> ep_devices = get_ep_devices(state);
+   for (const OrtEpDevice *ep_device : ep_devices) {
+     const OrtHardwareDevice *device = state.ort->EpDevice_Device(ep_device);
+     if (state.ort->HardwareDevice_Type(device) != OrtHardwareDeviceType_NPU) continue;
++    const char *ep_name = state.ort->EpDevice_EpName(ep_device);
++    if (amd_npu_only &&
++        (state.ort->HardwareDevice_VendorId(device) != kAmdVendorId ||
++         ep_name == nullptr || std::strcmp(ep_name, kVitisAIProvider) != 0)) continue;
++    if (matrix_dir && *matrix_dir) {
++      if (!create_matrix_graph(state, ep_device, matrix_dir, report_cache)) return false;
++      state.npu_device_id = state.ort->HardwareDevice_DeviceId(device);
++      return true;
++    }
+     std::string label = "NPU via " + describe_ep_device(state, ep_device);
+-    if (!create_options(state, true)) return false;
+-    if (!append_ep_device(state, ep_device)) continue;
+-    if (create_session(state, label.c_str())) return true;
++    if (cpu_partitions) label += " (CPU partitions allowed for diagnostics)";
++    if (!create_options(state, !cpu_partitions)) return false;
++    if (amd_npu_only && !check_status(state,
++        state.ort->SetSessionGraphOptimizationLevel(state.options, ORT_DISABLE_ALL),
++        "SetSessionGraphOptimizationLevel(ORT_DISABLE_ALL)")) return false;
++    if (!append_ep_device(state, ep_device, report_cache)) continue;
++    if (profile_path && *profile_path) {
++      state.profiling = check_status(state,
++          state.ort->EnableProfiling(state.options, absolute_path(profile_path).c_str()),
++          "EnableProfiling");
++      if (!state.profiling) return false;
++    }
++    if (create_session(state, label.c_str())) {
++      state.npu_device_id = state.ort->HardwareDevice_DeviceId(device);
++      return true;
++    }
++  }
++  if (amd_npu_only) {
++    std::fprintf(stderr, "rnnoise winml: no usable AMD VitisAI NPU session\n");
++    return false;
+   }
+   std::fprintf(stderr, "rnnoise winml: no ready catalog NPU EP device found\n");
+   if (try_create_openvino_npu_session(state)) return true;
+@@ -559,8 +818,21 @@ int init_winml() {
+   state->model_path = absolute_path(model_path);
+   const char *forced_ep = std::getenv("RNNOISE_WINML_EP");
+   ForcedSessionKind forced_kind = parse_forced_session_kind(forced_ep);
++  const bool amd_npu_only = rnn_winml_requires_npu() != 0;
++  if (amd_npu_only && forced_ep && *forced_ep && forced_kind != ForcedSessionKind::Npu) {
++    std::fprintf(stderr, "rnnoise winml: strict AMD NPU mode requires RNNOISE_WINML_EP=npu\n");
++    return -1;
++  }
+   std::fprintf(stderr, "rnnoise winml: session selector %s\n", forced_session_kind_name(forced_kind));
+   size_t forced_device_index = 0;
++  if (amd_npu_only || forced_kind == ForcedSessionKind::Cpu) {
++    const char *index = std::getenv("RNNOISE_WINML_EP_DEVICE_INDEX");
++    const char *alias = std::getenv("RNNOISE_WINML_DEVICE_INDEX");
++    if ((index && *index) || (alias && *alias)) {
++      std::fprintf(stderr, "rnnoise winml: device index overrides are disabled in AMD NPU and CPU modes\n");
++      return -1;
++    }
++  }
+   bool has_forced_device_index = read_ep_device_index(&forced_device_index);
+ 
+   if (!check_status(*state, state->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rnnoise-winml", &state->env),
+@@ -574,18 +846,37 @@ int init_winml() {
+     rnn_winml_shutdown();
+     return -1;
+   }
+-  register_catalog_providers(*state);
++  bool catalog_ready = false;
++  if (forced_kind != ForcedSessionKind::Cpu) {
++    catalog_ready = register_catalog_providers(*state, amd_npu_only);
++  }
+   if (has_forced_device_index && forced_kind != ForcedSessionKind::Auto) {
+     std::fprintf(stderr, "rnnoise winml: EP device index overrides RNNOISE_WINML_EP\n");
+   }
+-  if (has_forced_device_index
+-      ? !try_create_indexed_ep_device_session(*state, forced_device_index)
+-      : !select_forced_session(*state, forced_kind)) {
++  bool session_ready;
++  if (amd_npu_only) {
++    session_ready = catalog_ready && try_create_npu_session(*state, true);
++  } else if (has_forced_device_index) {
++    session_ready = try_create_indexed_ep_device_session(*state, forced_device_index);
++  } else {
++    session_ready = select_forced_session(*state, forced_kind);
++  }
++  if (!session_ready) {
+     g_state = std::move(state);
+     rnn_winml_shutdown();
+     return -1;
+   }
+ 
++  const char *calibration_path = std::getenv("RNNOISE_WINML_CALIBRATION");
++  if (forced_kind == ForcedSessionKind::Cpu && calibration_path && *calibration_path) {
++    state->calibration.reset(_wfopen(absolute_path(calibration_path).c_str(), L"wb"));
++    if (!state->calibration) {
++      std::fprintf(stderr, "rnnoise winml: could not open the calibration output\n");
++      g_state = std::move(state);
++      rnn_winml_shutdown();
++      return -1;
++    }
++  }
+   std::fwprintf(stderr, L"rnnoise winml: loaded %ls\n", state->model_path.c_str());
+   state->initialized = true;
+   g_state = std::move(state);
+@@ -594,6 +885,107 @@ int init_winml() {
+ 
+ }  // namespace
+ 
++extern "C" int rnn_winml_requires_npu(void) {
++  const char *required = std::getenv("RNNOISE_WINML_REQUIRE_NPU");
++  const char *selector = std::getenv("RNNOISE_WINML_EP");
++  return (required && *required) || (selector && _stricmp(selector, "npu") == 0);
++}
++
++extern "C" int rnn_winml_prepare(void) {
++  return init_winml();
++}
++
++extern "C" unsigned int rnn_winml_npu_device_id(void) {
++  return g_state ? g_state->npu_device_id : 0;
++}
++
++extern "C" long long rnn_winml_take_inference_us(void) {
++  const auto elapsed = inference_us;
++  inference_us = -1;
++  return elapsed;
++}
++
++extern "C" int rnn_winml_room_echo_hop(const float *input, float *output) {
++  if (init_winml() != 0 || !g_state->echo) return -1;
++  auto &echo = *g_state->echo;
++  std::copy_n(echo.window.data() + kEchoHop, kEchoHop, echo.window.data());
++  std::copy_n(input, kEchoHop, echo.window.data() + kEchoHop);
++  std::array<const OrtValue *, kEchoStates + 1> inputs;
++  std::array<OrtValue *, kEchoStates + 1> outputs;
++  inputs[0] = echo.window_tensor;
++  outputs[0] = echo.result_tensor;
++  for (size_t index = 0; index < kEchoStates; ++index) {
++    inputs[index + 1] = echo.states[index];
++    outputs[index + 1] = echo.next[index];
++  }
++  const auto started = InferenceClock::now();
++  if (!check_status(*g_state, g_state->ort->Run(g_state->session, nullptr, echo.input_names.data(),
++          inputs.data(), inputs.size(), echo.output_names.data(), outputs.size(), outputs.data()),
++          "Run(room echo)")) return -1;
++  set_inference_time(started);
++  echo.states.swap(echo.next);
++  if (!std::getenv("RNNOISE_WINML_ECHO_OVERLAP_ADD")) {
++    // Use the newest half of the model window directly to skip one overlap-add hop.
++    std::copy_n(echo.result.data() + kEchoHop, kEchoHop, output);
++    return 0;
++  }
++  for (size_t index = 0; index < kEchoHop; ++index) {
++    output[index] = 0.5f * (echo.result[index] + echo.tail[index]);
++    echo.tail[index] = echo.result[index + kEchoHop];
++  }
++  return 0;
++}
++
++extern "C" int rnn_winml_run_conv_canary(int recurrent_shape) {
++  ForcedSessionKind selector = parse_forced_session_kind(std::getenv("RNNOISE_WINML_EP"));
++  if (selector != ForcedSessionKind::Cpu && selector != ForcedSessionKind::Npu) {
++    std::fprintf(stderr, "canary requires RNNOISE_WINML_EP=cpu or npu\n");
++    return 1;
++  }
++  if (init_winml() != 0) return 2;
++
++  WinMLState &state = *g_state;
++  const OrtApi *api = state.ort;
++  const int64_t channels = recurrent_shape ? 384 : 8;
++  const int64_t size = recurrent_shape ? 1 : 16;
++  const size_t expected_count = recurrent_shape ? 1152 : 8 * 14 * 14;
++  std::vector<float> samples(static_cast<size_t>(channels * size * size), 1.0f);
++  const int64_t shape[] = {1, channels, size, size};
++  OrtValue *input = nullptr;
++  OrtValue *output = nullptr;
++  OrtTensorTypeAndShapeInfo *output_info = nullptr;
++  const char *input_names[] = {"input"};
++  const char *output_names[] = {"output"};
++  bool correct = false;
++
++  if (check_status(state,
++      api->CreateTensorWithDataAsOrtValue(state.memory_info, samples.data(), samples.size() * sizeof(float),
++          shape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input), "Canary input")) {
++    const OrtValue *inputs[] = {input};
++    size_t count = 0;
++    ONNXTensorElementDataType type;
++    void *data = nullptr;
++    if (check_status(state, api->Run(state.session, nullptr, input_names, inputs, 1,
++            output_names, 1, &output), "Canary Run") &&
++        check_status(state, api->GetTensorTypeAndShape(output, &output_info), "Canary output shape") &&
++        check_status(state, api->GetTensorShapeElementCount(output_info, &count), "Canary output size") &&
++        check_status(state, api->GetTensorElementType(output_info, &type), "Canary output type") &&
++        count == expected_count && type == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT &&
++        check_status(state, api->GetTensorMutableData(output, &data), "Canary output data")) {
++      const auto *values = static_cast<const float *>(data);
++      correct = std::all_of(values, values + count, [](float value) {
++        return value > 71.99f && value < 72.01f;
++      });
++    }
++  }
++  if (output_info) api->ReleaseTensorTypeAndShapeInfo(output_info);
++  if (output) api->ReleaseValue(output);
++  if (input) api->ReleaseValue(input);
++  rnn_winml_shutdown();
++  std::fprintf(stderr, "Convolution canary %s\n", correct ? "passed" : "failed");
++  return correct ? 0 : 3;
++}
++
+ extern "C" int compute_rnn_winml(
+     RNNState *rnn,
+     float *gains,
+@@ -601,10 +993,23 @@ extern "C" int compute_rnn_winml(
+     const float *features) {
+   if (init_winml()) return -1;
+ 
++  if (FILE *calibration = g_state->calibration.get()) {
++    // Input order matches rnn_ort_common.cpp. Capture states before ORT updates them.
++    if (std::fwrite(features, sizeof(float), CONV1_IN_SIZE, calibration) != CONV1_IN_SIZE ||
++        std::fwrite(rnn, sizeof(float), sizeof(*rnn) / sizeof(float), calibration) !=
++            sizeof(*rnn) / sizeof(float)) {
++      std::fprintf(stderr, "rnnoise winml: could not write the calibration frame\n");
++      std::exit(1);
++    }
++  }
+   while (g_state->session != nullptr) {
+     RnnOrtRuntime runtime = {g_state->ort, g_state->session, g_state->memory_info, "rnnoise winml"};
++    const auto started = InferenceClock::now();
+     int ret = rnn_ort_run_session(&runtime, rnn, gains, vad, features);
+-    if (ret == 0) return 0;
++    if (ret == 0) {
++      set_inference_time(started);
++      return 0;
++    }
+ 
+     std::fprintf(stderr, "rnnoise winml: evaluate on %s failed, trying next device\n",
+         g_state->selected_device.c_str());
+@@ -618,8 +1023,21 @@ extern "C" int compute_rnn_winml(
+ extern "C" void rnn_winml_shutdown(void) {
+   if (g_state) {
+     if (g_state->ort != nullptr) {
++      if (g_state->profiling && g_state->session != nullptr) {
++        OrtAllocator *allocator = nullptr;
++        char *filename = nullptr;
++        if (check_status(*g_state, g_state->ort->GetAllocatorWithDefaultOptions(&allocator),
++                "GetAllocatorWithDefaultOptions") &&
++            check_status(*g_state, g_state->ort->SessionEndProfiling(g_state->session, allocator, &filename),
++                "SessionEndProfiling") && filename != nullptr) {
++          std::fprintf(stderr, "rnnoise winml: wrote profile %s\n", filename);
++          check_status(*g_state, g_state->ort->AllocatorFree(allocator, filename), "AllocatorFree");
++        }
++      }
+       if (g_state->session != nullptr) g_state->ort->ReleaseSession(g_state->session);
+       if (g_state->options != nullptr) g_state->ort->ReleaseSessionOptions(g_state->options);
++      g_state->echo.reset();
++      g_state->matrix_graph.reset();
+       if (g_state->memory_info != nullptr) g_state->ort->ReleaseMemoryInfo(g_state->memory_info);
+       if (g_state->env != nullptr) {
+         for (const RegisteredProvider &provider : g_state->providers) {
+diff --git a/src/rnn_winml.h b/src/rnn_winml.h
+index 74724c3..2ade35b 100644
+--- a/src/rnn_winml.h
++++ b/src/rnn_winml.h
+@@ -9,6 +9,12 @@ int compute_rnn_winml(
+     float *vad,
+     const float *features);
+ void rnn_winml_shutdown(void);
++int rnn_winml_requires_npu(void);
++int rnn_winml_prepare(void);
++unsigned int rnn_winml_npu_device_id(void);
++long long rnn_winml_take_inference_us(void);
++int rnn_winml_room_echo_hop(const float *input, float *output);
++int rnn_winml_run_conv_canary(int recurrent_shape);
+ int rnn_winml_list_execution_providers(const char *ensure_selector);
+ 
+ #endif
+diff --git a/tools/rnnoise_winml_ep_tool.cpp b/tools/rnnoise_winml_ep_tool.cpp
+index 6d1a7d7..8e7c01a 100644
+--- a/tools/rnnoise_winml_ep_tool.cpp
++++ b/tools/rnnoise_winml_ep_tool.cpp
+@@ -1,5 +1,13 @@
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <memory>
++#include <numeric>
++#include <vector>
+ 
+ extern "C" {
+ #include "rnn_winml.h"
+@@ -9,8 +17,60 @@ static void usage(const char *argv0) {
+   std::fprintf(stderr,
+       "usage:\n"
+       "  %s list\n"
+-      "  %s ensure <index-or-name-substring>\n",
+-      argv0, argv0);
++      "  %s ensure <index-or-name-substring>\n"
++      "  %s conv-canary [gru-shape]\n"
++      "  %s room-echo <input-16k-s16.pcm> <output.pcm>\n",
++      argv0, argv0, argv0, argv0);
++}
++
++static int run_room_echo(const char *input_path, const char *output_path) {
++  using Clock = std::chrono::steady_clock;
++  using Milliseconds = std::chrono::duration<double, std::milli>;
++  if (std::strcmp(input_path, output_path) == 0) return 1;
++  std::unique_ptr<FILE, decltype(&std::fclose)> input(std::fopen(input_path, "rb"), std::fclose);
++  if (!input) return 1;
++  std::unique_ptr<FILE, decltype(&std::fclose)> output(std::fopen(output_path, "wb"), std::fclose);
++  if (!output) return 1;
++  if (_putenv_s("RNNOISE_WINML_ROOM_ECHO", "1") || _putenv_s("RNNOISE_WINML_EP", "npu")) return 1;
++  const auto start = Clock::now();
++  if (rnn_winml_prepare() != 0) return 2;
++  const double startup_ms = Milliseconds(Clock::now() - start).count();
++
++  constexpr size_t hop = 256;
++  std::array<short, hop> pcm{};
++  std::array<float, hop> samples{};
++  std::array<float, hop> result{};
++  std::vector<double> timings;
++  size_t previous_count = 0;
++  bool ok = true;
++  do {
++    const auto count = std::fread(pcm.data(), sizeof(short), pcm.size(), input.get());
++    if (std::ferror(input.get())) { ok = false; break; }
++    for (size_t index = 0; index < hop; ++index) {
++      samples[index] = index < count ? pcm[index] / 32768.0f : 0.0f;
++    }
++    if (!count && !previous_count) break;
++    const auto began = Clock::now();
++    if (rnn_winml_room_echo_hop(samples.data(), result.data()) != 0) { ok = false; break; }
++    timings.push_back(Milliseconds(Clock::now() - began).count());
++    for (size_t index = 0; index < previous_count; ++index) {
++      pcm[index] = std::isfinite(result[index]) ?
++          static_cast<short>(std::clamp(result[index] * 32768.0f, -32768.0f, 32767.0f)) : 0;
++    }
++    if (std::fwrite(pcm.data(), sizeof(short), previous_count, output.get()) != previous_count) {
++      ok = false;
++      break;
++    }
++    previous_count = count;
++  } while (previous_count);
++  rnn_winml_shutdown();
++  if (std::fflush(output.get()) != 0 || !ok || timings.empty()) return 3;
++  const auto elapsed = std::accumulate(timings.begin(), timings.end(), 0.0);
++  const auto late = std::count_if(timings.begin(), timings.end(), [](double ms) { return ms > 16; });
++  std::sort(timings.begin(), timings.end());
++  std::fprintf(stderr, "Room echo: %zu hops, startup %.2f ms, mean %.2f ms, P95 %.2f ms, %zu over 16 ms\n",
++      timings.size(), startup_ms, elapsed / timings.size(), timings[(timings.size() * 95 - 1) / 100], late);
++  return 0;
+ }
+ 
+ int main(int argc, char **argv) {
+@@ -20,6 +80,15 @@ int main(int argc, char **argv) {
+   if (argc == 3 && std::strcmp(argv[1], "ensure") == 0) {
+     return rnn_winml_list_execution_providers(argv[2]);
+   }
++  if (argc == 2 && std::strcmp(argv[1], "conv-canary") == 0) {
++    return rnn_winml_run_conv_canary(0);
++  }
++  if (argc == 3 && std::strcmp(argv[1], "conv-canary") == 0 && std::strcmp(argv[2], "gru-shape") == 0) {
++    return rnn_winml_run_conv_canary(1);
++  }
++  if (argc == 4 && std::strcmp(argv[1], "room-echo") == 0) {
++    return run_room_echo(argv[2], argv[3]);
++  }
+   usage(argv[0]);
+   return 1;
+-}
+\ No newline at end of file
++}

@@ -1,0 +1,186 @@
+diff --git a/src/rnn_winml.cpp b/src/rnn_winml.cpp
+index 27d9dda..2f80981 100644
+--- a/src/rnn_winml.cpp
++++ b/src/rnn_winml.cpp
+@@ -232,16 +232,34 @@ const SessionCandidate kCandidates[] = {
+     SessionCandidate::Cpu,
+ };
+ 
++// CreateEnv returns the same ORT environment while any session still owns it.
++struct SharedWinMLEnvironment {
++  explicit SharedWinMLEnvironment(const OrtApi *api) : ort(api) {}
++  ~SharedWinMLEnvironment() {
++    if (env != nullptr) {
++      for (const RegisteredProvider &provider : providers) {
++        OrtStatus *status = ort->UnregisterExecutionProviderLibrary(env, provider.name.c_str());
++        if (status != nullptr) ort->ReleaseStatus(status);
++      }
++      ort->ReleaseEnv(env);
++    }
++    if (catalog != nullptr) WinMLEpCatalogRelease(catalog);
++  }
++
++  const OrtApi *ort;
++  OrtEnv *env = nullptr;
++  WinMLEpCatalogHandle catalog = nullptr;
++  std::vector<RegisteredProvider> providers;
++};
++
+ struct WinMLState {
+   const OrtApi *ort = nullptr;
+-  OrtEnv *env = nullptr;
++  std::shared_ptr<SharedWinMLEnvironment> runtime;
+   OrtSessionOptions *options = nullptr;
+   OrtSession *session = nullptr;
+   OrtMemoryInfo *memory_info = nullptr;
+   std::unique_ptr<MatrixGraph> matrix_graph;
+   std::unique_ptr<EchoState> echo;
+-  WinMLEpCatalogHandle catalog = nullptr;
+-  std::vector<RegisteredProvider> providers;
+   std::string selected_device;
+   uint32_t npu_device_id = 0;
+   std::wstring model_path;
+@@ -253,6 +271,7 @@ struct WinMLState {
+ };
+ 
+ std::unique_ptr<WinMLState> g_state;
++std::weak_ptr<SharedWinMLEnvironment> g_runtime;
+ bool g_init_attempted = false;
+ 
+ std::wstring widen(const char *path) {
+@@ -429,10 +448,12 @@ BOOL CALLBACK collect_provider(WinMLEpHandle ep, const WinMLEpInfo *info, void *
+ }
+ 
+ bool register_catalog_providers(WinMLState &state, bool amd_npu_only) {
+-  if (failed_hr(WinMLEpCatalogCreate(&state.catalog), "WinMLEpCatalogCreate")) return false;
++  auto &runtime = *state.runtime;
++  if (runtime.catalog == nullptr &&
++      failed_hr(WinMLEpCatalogCreate(&runtime.catalog), "WinMLEpCatalogCreate")) return false;
+ 
+   CatalogCollection collection{{}, amd_npu_only};
+-  if (failed_hr(WinMLEpCatalogEnumProviders(state.catalog, collect_provider, &collection),
++  if (failed_hr(WinMLEpCatalogEnumProviders(runtime.catalog, collect_provider, &collection),
+                 "WinMLEpCatalogEnumProviders")) {
+     return false;
+   }
+@@ -446,27 +467,33 @@ bool register_catalog_providers(WinMLState &state, bool amd_npu_only) {
+     }
+     if (provider.ready_state != WinMLEpReadyState_Ready || provider.path.empty()) continue;
+ 
++    if (std::any_of(runtime.providers.begin(), runtime.providers.end(),
++                   [&](const RegisteredProvider &p) { return p.path == provider.path; })) {
++      std::fprintf(stderr, "rnnoise winml: reusing registered provider %s\n", provider.name.c_str());
++      continue;
++    }
++
+     std::string registration_name = provider.name.empty()
+-        ? "rnnoise_winml_ep_" + std::to_string(state.providers.size())
++        ? "rnnoise_winml_ep_" + std::to_string(runtime.providers.size())
+         : provider.name;
+-    if (std::any_of(state.providers.begin(), state.providers.end(),
++    if (std::any_of(runtime.providers.begin(), runtime.providers.end(),
+                    [&](const RegisteredProvider &p) { return p.name == registration_name; })) {
+-      registration_name += "_" + std::to_string(state.providers.size());
++      registration_name += "_" + std::to_string(runtime.providers.size());
+     }
+ 
+     std::wstring library_path = widen(provider.path.c_str());
+     if (check_status(state,
+-        state.ort->RegisterExecutionProviderLibrary(state.env, registration_name.c_str(), library_path.c_str()),
++        state.ort->RegisterExecutionProviderLibrary(runtime.env, registration_name.c_str(), library_path.c_str()),
+         "RegisterExecutionProviderLibrary")) {
+-      state.providers.push_back({registration_name, provider.path});
++      runtime.providers.push_back({registration_name, provider.path});
+       std::fprintf(stderr, "rnnoise winml: registered provider %s\n", registration_name.c_str());
+     }
+   }
+ 
+-  if (state.providers.empty()) {
++  if (runtime.providers.empty()) {
+     std::fprintf(stderr, "rnnoise winml: no Windows ML execution providers registered\n");
+   }
+-  return !state.providers.empty();
++  return !runtime.providers.empty();
+ }
+ 
+ bool create_options(WinMLState &state, bool disable_cpu_fallback) {
+@@ -510,7 +537,7 @@ std::vector<const OrtEpDevice *> get_ep_devices(WinMLState &state) {
+   const OrtEpDevice *const *ep_devices = nullptr;
+   size_t num_ep_devices = 0;
+   std::vector<const OrtEpDevice *> out;
+-  if (!check_status(state, state.ort->GetEpDevices(state.env, &ep_devices, &num_ep_devices), "GetEpDevices")) {
++  if (!check_status(state, state.ort->GetEpDevices(state.runtime->env, &ep_devices, &num_ep_devices), "GetEpDevices")) {
+     return out;
+   }
+   for (size_t i = 0; i < num_ep_devices; ++i) {
+@@ -530,7 +557,7 @@ bool append_ep_device(WinMLState &state, const OrtEpDevice *ep_device, const cha
+   const char *keys[] = {"enable_cache_file_io_in_mem", "cache_dir"};
+   const char *values[] = {"0", report_cache};
+   return check_status(state,
+-      state.ort->SessionOptionsAppendExecutionProvider_V2(state.options, state.env, devices, 1,
++      state.ort->SessionOptionsAppendExecutionProvider_V2(state.options, state.runtime->env, devices, 1,
+           report_cache ? keys : nullptr, report_cache ? values : nullptr, report_cache ? 2 : 0),
+       "SessionOptionsAppendExecutionProvider_V2");
+ }
+@@ -556,7 +583,7 @@ bool create_session(WinMLState &state, const char *label) {
+     state.session = nullptr;
+   }
+   if (!check_status(state,
+-      state.ort->CreateSession(state.env, state.model_path.c_str(), state.options, &state.session),
++      state.ort->CreateSession(state.runtime->env, state.model_path.c_str(), state.options, &state.session),
+       "CreateSession")) {
+     return false;
+   }
+@@ -567,7 +594,7 @@ bool create_session(WinMLState &state, const char *label) {
+ 
+ bool has_ready_openvino_provider(const WinMLState &state) {
+   if (state.ready_openvino_catalog_provider) return true;
+-  return std::any_of(state.providers.begin(), state.providers.end(),
++  return std::any_of(state.runtime->providers.begin(), state.runtime->providers.end(),
+       [](const RegisteredProvider &provider) {
+         return contains_case_insensitive(provider.name.c_str(), "openvino");
+       });
+@@ -603,7 +630,7 @@ bool create_matrix_graph(WinMLState &state, const OrtEpDevice *device, const cha
+       const auto path = root + L"\\matrix-" + std::to_wstring(index) + L".onnx";
+       std::fwprintf(stderr, L"rnnoise winml: loading NPU projection %ls\n", path.c_str());
+       OrtSession *session = nullptr;
+-      if (!check_status(state, state.ort->CreateSession(state.env, path.c_str(), state.options, &session),
++      if (!check_status(state, state.ort->CreateSession(state.runtime->env, path.c_str(), state.options, &session),
+               "CreateSession(NPU projection)")) return false;
+       matrices->op.sessions.emplace_back(session);
+     }
+@@ -835,9 +862,15 @@ int init_winml() {
+   }
+   bool has_forced_device_index = read_ep_device_index(&forced_device_index);
+ 
+-  if (!check_status(*state, state->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rnnoise-winml", &state->env),
+-                    "CreateEnv")) {
+-    return -1;
++  state->runtime = g_runtime.lock();
++  if (!state->runtime) {
++    auto runtime = std::make_shared<SharedWinMLEnvironment>(state->ort);
++    if (!check_status(*state, state->ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "rnnoise-winml", &runtime->env),
++                      "CreateEnv")) {
++      return -1;
++    }
++    g_runtime = runtime;
++    state->runtime = std::move(runtime);
+   }
+   if (!check_status(*state, state->ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault,
+                                                             &state->memory_info),
+@@ -1039,15 +1072,7 @@ extern "C" void rnn_winml_shutdown(void) {
+       g_state->echo.reset();
+       g_state->matrix_graph.reset();
+       if (g_state->memory_info != nullptr) g_state->ort->ReleaseMemoryInfo(g_state->memory_info);
+-      if (g_state->env != nullptr) {
+-        for (const RegisteredProvider &provider : g_state->providers) {
+-          OrtStatus *status = g_state->ort->UnregisterExecutionProviderLibrary(g_state->env, provider.name.c_str());
+-          if (status != nullptr) g_state->ort->ReleaseStatus(status);
+-        }
+-        g_state->ort->ReleaseEnv(g_state->env);
+-      }
+     }
+-    if (g_state->catalog != nullptr) WinMLEpCatalogRelease(g_state->catalog);
+   }
+   g_state.reset();
+   g_init_attempted = false;

@@ -1,0 +1,26 @@
+diff --git a/src/rnn_winml.cpp b/src/rnn_winml.cpp
+--- a/src/rnn_winml.cpp
++++ b/src/rnn_winml.cpp
+@@ -708,3 +1126,10 @@ extern "C" int rnn_winml_list_execution_providers(const char *ensure_selector) {
+   }
+   return 0;
+ }
++
++extern "C" void *rnn_winml_exchange_session(void *session) {
++  auto *previous = g_state.release();
++  g_state.reset(static_cast<WinMLState *>(session));
++  g_init_attempted = g_state != nullptr;
++  return previous;
++}
+diff --git a/src/rnn_winml.h b/src/rnn_winml.h
+--- a/src/rnn_winml.h
++++ b/src/rnn_winml.h
+@@ -3,5 +3,8 @@
+ 
+ #include "rnn.h"
+ 
++/* Exchange the active session with a previously detached session, or NULL. */
++void *rnn_winml_exchange_session(void *session);
++
+ int compute_rnn_winml(
+     RNNState *rnn,
